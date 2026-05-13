@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: blackhawk-api
+    env: node
+    plan: free
+    autoDeploy: true
+    rootDir: render_api
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: API_TOKEN_SECRET
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: RESPONSE_SIGNING_KEY
+        sync: false
+      - key: VALID_LICENSE_KEYS
+        sync: false
+      - key: BLACKLIST_KEYS
+        sync: false
+      - key: BLACKLIST_HWIDS
+        sync: false
+      - key: JWT_TTL_SECONDS
+        value: 600
