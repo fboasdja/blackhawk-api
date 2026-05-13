@@ -1,39 +1,37 @@
+require("dotenv").config();
+
 const express = require("express");
 const cors = require("cors");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+const axios = require("axios");
 const crypto = require("crypto");
 const jwt = require("jsonwebtoken");
 
 const app = express();
+
 const PORT = Number(process.env.PORT || 10000);
+const NODE_ENV = String(process.env.NODE_ENV || "production");
 const DEBUG = String(process.env.DEBUG_AUTH || "").toLowerCase() === "true";
-const API_TOKEN_SECRET = process.env.API_TOKEN_SECRET || "";
-const JWT_SECRET = process.env.JWT_SECRET || "";
-const RESPONSE_SIGNING_KEY = process.env.RESPONSE_SIGNING_KEY || "";
-const BOT_VALIDATE_URL = (process.env.BOT_VALIDATE_URL || "").trim();
-const VALID_LICENSE_KEYS = new Set(
-  (process.env.VALID_LICENSE_KEYS || "")
-    .split(",")
-    .map((x) => x.trim())
-    .filter(Boolean)
-);
-const BLACKLIST_KEYS = new Set(
-  (process.env.BLACKLIST_KEYS || "")
-    .split(",")
-    .map((x) => x.trim())
-    .filter(Boolean)
-);
-const BLACKLIST_HWIDS = new Set(
-  (process.env.BLACKLIST_HWIDS || "")
-    .split(",")
-    .map((x) => x.trim())
-    .filter(Boolean)
-);
-const REPLAY_WINDOW_SEC = 120;
-const RATE_LIMIT_WINDOW_MS = 60_000;
-const RATE_LIMIT_MAX_REQ = 30;
-const JWT_TTL_SECONDS = Math.max(60, Number(process.env.JWT_TTL_SECONDS || 600));
-const recentNonces = new Map();
-const rateMap = new Map();
+
+// Security
+const API_TOKEN_SECRET = String(process.env.API_TOKEN_SECRET || "").trim(); // app -> api (optional hardening)
+const BOT_SHARED_SECRET = String(process.env.BOT_SHARED_SECRET || "").trim(); // api -> bot (required)
+const JWT_SECRET = String(process.env.JWT_SECRET || "").trim(); // required
+const RESPONSE_SIGNING_KEY = String(process.env.RESPONSE_SIGNING_KEY || "").trim(); // required (anti fake response)
+const BOT_WAIT_MS = Math.max(1500, Number(process.env.BOT_WAIT_MS || 8000)); // API waits for bot result (long-poll)
+
+const JWT_TTL_SECONDS = Math.max(60, Number(process.env.JWT_TTL_SECONDS || 900));
+const REPLAY_WINDOW_SEC = Math.max(30, Number(process.env.REPLAY_WINDOW_SEC || 120));
+const REQUIRE_HTTPS = String(process.env.REQUIRE_HTTPS || "true").toLowerCase() !== "false";
+
+const recentNonces = new Map(); // nonce -> ts_ms
+
+// Pull-mode queue (in-memory). Bot polls /v1/bot/pull, then pushes result /v1/bot/push.
+// Note: On Render free tier, instance restarts will clear memory; keep BOT_WAIT_MS small.
+const queue = [];
+const waiters = new Map(); // request_id -> { resolve, timeout }
+let reqSeq = 0;
 
 const C = {
   reset: "\x1b[0m",
@@ -41,269 +39,280 @@ const C = {
   green: "\x1b[32m",
   yellow: "\x1b[33m",
   red: "\x1b[31m",
+  gray: "\x1b[90m",
 };
 
+function ts() {
+  return new Date().toISOString();
+}
+function log(tag, color, msg) {
+  // eslint-disable-next-line no-console
+  console.log(`${C.gray}${ts()}${C.reset} ${color}${tag}${C.reset} ${msg}`);
+}
 function logInfo(msg) {
-  console.log(`${C.cyan}[AUTH]${C.reset} ${msg}`);
+  log("[API]", C.cyan, msg);
 }
 function logOk(msg) {
-  console.log(`${C.green}[AUTH]${C.reset} ${msg}`);
+  log("[SUCCESS]", C.green, msg);
 }
 function logWarn(msg) {
-  console.warn(`${C.yellow}[AUTH]${C.reset} ${msg}`);
+  log("[SECURITY]", C.yellow, msg);
 }
 function logErr(msg) {
-  console.error(`${C.red}[AUTH]${C.reset} ${msg}`);
-}
-function logDebug(msg) {
-  if (DEBUG) console.log(`${C.cyan}[DEBUG]${C.reset} ${msg}`);
+  log("[ERROR]", C.red, msg);
 }
 
-app.set("trust proxy", true);
-app.use(
-  cors({
-    origin: "*",
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
-);
-app.use(express.json({ limit: "64kb", strict: true }));
+function responseSignature(payload) {
+  if (!RESPONSE_SIGNING_KEY) return "";
+  const normalized = JSON.stringify(payload, Object.keys(payload).sort());
+  return crypto.createHash("sha256").update(`${normalized}.${RESPONSE_SIGNING_KEY}`).digest("hex");
+}
 
-app.use((req, res, next) => {
-  if (req.method === "POST" && !req.is("application/json")) {
-    return res.status(415).json({ success: false, error: "INVALID_CONTENT_TYPE" });
+function sendJson(res, statusCode, payload) {
+  if (RESPONSE_SIGNING_KEY) {
+    res.set("X-Response-Signature", responseSignature(payload));
   }
-  next();
-});
+  return res.status(statusCode).type("application/json").send(JSON.stringify(payload));
+}
 
-app.use((req, res, next) => {
-  const ip = String(req.ip || req.socket.remoteAddress || "unknown");
-  const now = Date.now();
-  const arr = rateMap.get(ip) || [];
-  const fresh = arr.filter((ts) => now - ts < RATE_LIMIT_WINDOW_MS);
-  fresh.push(now);
-  rateMap.set(ip, fresh);
-  if (fresh.length > RATE_LIMIT_MAX_REQ) {
-    logWarn(`rate limit ip=${ip}`);
-    return res.status(429).json({ success: false, error: "TOO_MANY_REQUESTS" });
-  }
-  next();
-});
+function isHttpsReq(req) {
+  const proto = String(req.get("x-forwarded-proto") || "").toLowerCase();
+  return proto === "https";
+}
 
 function cleanupReplay() {
   const now = Date.now();
-  for (const [nonce, ts] of recentNonces.entries()) {
-    if (now - ts > REPLAY_WINDOW_SEC * 1000) {
-      recentNonces.delete(nonce);
-    }
+  for (const [nonce, ms] of recentNonces.entries()) {
+    if (now - ms > REPLAY_WINDOW_SEC * 1000) recentNonces.delete(nonce);
   }
-}
-
-function isValidBody(body) {
-  if (!body || typeof body !== "object" || Array.isArray(body)) return false;
-  const required = ["license_key", "hwid", "app_version", "checksum", "nonce", "timestamp"];
-  return required.every((k) => Object.prototype.hasOwnProperty.call(body, k));
-}
-
-function invalidField(v, maxLen = 256) {
-  return typeof v !== "string" || v.length === 0 || v.length > maxLen;
 }
 
 function readApiToken(req) {
   return String(req.get("X-Api-Token") || req.get("Authorization") || "").replace(/^Bearer\s+/i, "").trim();
 }
 
-function requireApiToken(req, res, next) {
-  // Optional hardening: when API_TOKEN_SECRET is configured, require matching token header.
-  if (!API_TOKEN_SECRET) return next();
-  const token = readApiToken(req);
-  if (!token || token !== API_TOKEN_SECRET) {
-    return responseWithSignature(res, 401, { success: false, error: "UNAUTHORIZED" });
+function safeString(v, maxLen) {
+  if (typeof v !== "string") return "";
+  const s = v.trim();
+  if (!s || s.length > maxLen) return "";
+  return s;
+}
+
+function validateLoginBody(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return { ok: false, error: "INVALID_BODY" };
+  const license_key = safeString(body.license_key, 128);
+  const hwid = safeString(body.hwid, 256);
+  const pc_name = safeString(body.pc_name, 128);
+  const app_version = safeString(body.app_version, 64);
+  const ip = safeString(body.ip || "", 64); // optional; API will override from req.ip
+  const nonce = safeString(body.nonce || "", 128);
+
+  const timestamp = Number(body.timestamp);
+  if (!license_key || !hwid || !pc_name || !app_version) return { ok: false, error: "INVALID_FIELDS" };
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return { ok: false, error: "INVALID_TIMESTAMP" };
+  if (!nonce) return { ok: false, error: "MISSING_NONCE" };
+
+  return { ok: true, license_key, hwid, pc_name, app_version, ip, nonce, timestamp };
+}
+
+async function callBotAuth(payload, sourceIp) {
+  if (!BOT_SHARED_SECRET) throw new Error("BOT_SHARED_SECRET missing");
+  // In pull-mode, API does not call bot directly.
+  // This function is kept for compatibility but no longer used.
+  return { status: 503, data: { ok: false, reason: "PULL_MODE" } };
+}
+
+function signJwt({ license_key, hwid, plan, expires }) {
+  if (!JWT_SECRET) throw new Error("JWT_SECRET missing");
+  return jwt.sign({ license_key, hwid, plan, expires }, JWT_SECRET, {
+    algorithm: "HS256",
+    expiresIn: JWT_TTL_SECONDS,
+    issuer: "blackhawk-api",
+  });
+}
+
+app.set("trust proxy", true);
+app.use(helmet());
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Api-Token"],
+  }),
+);
+
+app.use(
+  express.json({
+    limit: "64kb",
+    strict: true,
+  }),
+);
+
+app.use(
+  rateLimit({
+    windowMs: 60_000,
+    max: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: (req, res) => {
+      const ip = String(req.ip || "unknown");
+      logWarn(`rate limit ip=${ip}`);
+      return sendJson(res, 429, { success: false, error: "TOO_MANY_REQUESTS" });
+    },
+  }),
+);
+
+// content-type enforcement for POST
+app.use((req, res, next) => {
+  if (req.method === "POST" && !req.is("application/json")) {
+    return sendJson(res, 415, { success: false, error: "INVALID_CONTENT_TYPE" });
+  }
+  next();
+});
+
+// Anti invalid JSON
+app.use((err, _req, res, next) => {
+  if (err instanceof SyntaxError && "body" in err) {
+    return sendJson(res, 400, { success: false, error: "INVALID_JSON" });
+  }
+  next(err);
+});
+
+app.get("/", (_req, res) => sendJson(res, 200, { success: true, service: "blackhawk-api", status: "ok" }));
+app.get("/health", (_req, res) => sendJson(res, 200, { success: true, status: "healthy" }));
+
+function requireBotSecret(req, res, next) {
+  if (!BOT_SHARED_SECRET) {
+    return sendJson(res, 503, { success: false, error: "BOT_SHARED_SECRET_MISSING" });
+  }
+  const s = String(req.get("X-Bot-Secret") || "").trim();
+  if (!s || s !== BOT_SHARED_SECRET) {
+    return sendJson(res, 401, { success: false, error: "UNAUTHORIZED" });
   }
   return next();
 }
 
-function signToken(licenseKey, hwid, plan, expires) {
-  if (!JWT_SECRET) {
-    throw new Error("JWT_SECRET missing");
-  }
-  return jwt.sign(
-    { license_key: licenseKey, hwid, plan, expires },
-    JWT_SECRET,
-    { algorithm: "HS256", expiresIn: JWT_TTL_SECONDS, issuer: "blackhawk-api" }
-  );
-}
-
-function responseWithSignature(res, statusCode, payload) {
-  const raw = JSON.stringify(payload);
-  if (RESPONSE_SIGNING_KEY) {
-    const normalized = JSON.stringify(payload, Object.keys(payload).sort());
-    const sig = crypto
-      .createHash("sha256")
-      .update(`${normalized}.${RESPONSE_SIGNING_KEY}`)
-      .digest("hex");
-    res.set("X-Response-Signature", sig);
-  }
-  return res.status(statusCode).type("application/json").send(raw);
-}
-
-async function validateViaBotApi({ license_key, hwid, ip }) {
-  if (!BOT_VALIDATE_URL) {
-    return { ok: false, message: "BOT_VALIDATE_URL missing" };
-  }
-  try {
-    const r = await fetch(BOT_VALIDATE_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        license_key,
-        hwid,
-        ip,
-      }),
-    });
-    const data = await r.json().catch(() => ({}));
-    return data && typeof data === "object" ? data : { ok: false, message: "Invalid bot response" };
-  } catch (e) {
-    return { ok: false, message: `Bot API unreachable: ${e && e.message ? e.message : String(e)}` };
-  }
-}
-
-app.get("/", (_req, res) => {
-  res.status(200).json({ success: true, service: "blackhawk-api", status: "ok" });
+app.post("/v1/bot/pull", requireBotSecret, (req, res) => {
+  const item = queue.shift() || null;
+  return sendJson(res, 200, { success: true, item });
 });
 
-app.get("/health", (_req, res) => {
-  res.status(200).json({ success: true, status: "healthy" });
+app.post("/v1/bot/push", requireBotSecret, (req, res) => {
+  const body = req.body || {};
+  const request_id = Number(body.request_id);
+  if (!Number.isFinite(request_id) || request_id <= 0) {
+    return sendJson(res, 400, { success: false, error: "INVALID_REQUEST_ID" });
+  }
+  const ok = Boolean(body.ok);
+  const reason = safeString(String(body.reason || ""), 64) || (ok ? "OK" : "INVALID_KEY");
+  const username = safeString(String(body.username || "hawk-user"), 64) || "hawk-user";
+  const plan = safeString(String(body.plan || "premium"), 32) || "premium";
+  const expires = safeString(String(body.expires || "∞"), 64) || "∞";
+
+  const waiter = waiters.get(request_id);
+  if (waiter) {
+    clearTimeout(waiter.timeout);
+    waiters.delete(request_id);
+    waiter.resolve({ ok, reason, username, plan, expires });
+  }
+  return sendJson(res, 200, { success: true });
 });
 
-async function handleValidate(req, res) {
-  cleanupReplay();
+// Main route (per prompt)
+app.post("/V1/login", async (req, res) => {
+  const ip = String(req.ip || req.socket.remoteAddress || "unknown");
   const start = Date.now();
+
   try {
-    if (!isValidBody(req.body)) {
-      return responseWithSignature(res, 400, { success: false, error: "INVALID_BODY" });
-    }
-    const { license_key, hwid, app_version, checksum, nonce, timestamp } = req.body;
-
-    if (
-      invalidField(license_key, 128) ||
-      invalidField(hwid, 256) ||
-      invalidField(app_version, 64) ||
-      invalidField(checksum, 128) ||
-      invalidField(nonce, 128)
-    ) {
-      return responseWithSignature(res, 400, { success: false, error: "INVALID_FIELDS" });
-    }
-    if (!Number.isInteger(timestamp)) {
-      return responseWithSignature(res, 400, { success: false, error: "INVALID_TIMESTAMP" });
+    if (REQUIRE_HTTPS && NODE_ENV === "production" && !isHttpsReq(req)) {
+      logWarn(`blocked non-https ip=${ip}`);
+      return sendJson(res, 403, { success: false, error: "HTTPS_REQUIRED" });
     }
 
-    const nowSec = Math.floor(Date.now() / 1000);
-    if (Math.abs(nowSec - timestamp) > REPLAY_WINDOW_SEC) {
-      return responseWithSignature(res, 401, { success: false, error: "TIMESTAMP_EXPIRED" });
-    }
-    if (recentNonces.has(nonce)) {
-      return responseWithSignature(res, 409, { success: false, error: "REPLAY_DETECTED" });
-    }
-    recentNonces.set(nonce, Date.now());
-
-    const expectedChecksum = crypto
-      .createHash("sha256")
-      .update(`${license_key}|${hwid}|${app_version}|${nonce}|${timestamp}`)
-      .digest("hex");
-    if (checksum !== expectedChecksum) {
-      return responseWithSignature(res, 401, { success: false, error: "INVALID_CHECKSUM" });
-    }
-
-    if (BLACKLIST_KEYS.has(license_key) || BLACKLIST_HWIDS.has(hwid)) {
-      return responseWithSignature(res, 403, { success: false, error: "BLACKLISTED" });
-    }
-    const sourceIp = String(req.ip || req.socket.remoteAddress || ip || "");
-    const botRes = await validateViaBotApi({ license_key, hwid, ip: sourceIp });
-    if (!(botRes.ok || botRes.success)) {
-      const msg = String(botRes.message || botRes.error || "INVALID_KEY");
-      if (/key|invalid/i.test(msg)) {
-        logWarn(`invalid key=${license_key}`);
-        return responseWithSignature(res, 401, { success: false, error: "INVALID_KEY" });
+    if (API_TOKEN_SECRET) {
+      const token = readApiToken(req);
+      if (!token || token !== API_TOKEN_SECRET) {
+        logWarn(`unauthorized app token ip=${ip}`);
+        return sendJson(res, 401, { success: false, error: "UNAUTHORIZED" });
       }
-      logWarn(`bot validate failed: ${msg}`);
-      return responseWithSignature(res, 503, { success: false, error: "UPSTREAM_AUTH_UNAVAILABLE" });
     }
 
-    const username = String(botRes.username || "hawk-user");
-    const plan = "premium";
-    const expires = String(botRes.expires || new Date(Date.now() + JWT_TTL_SECONDS * 1000).toISOString());
-    const token = signToken(license_key, hwid, plan, expires);
+    const v = validateLoginBody(req.body);
+    if (!v.ok) return sendJson(res, 400, { success: false, error: v.error });
 
-    logOk(`auth success key=${license_key} hwid=${hwid} ms=${Date.now() - start}`);
-    return responseWithSignature(res, 200, {
-      success: true,
-      token,
-      username,
-      plan,
-      expires,
+    cleanupReplay();
+    const nowSec = Math.floor(Date.now() / 1000);
+    const tsSec = Math.floor(v.timestamp);
+    if (Math.abs(nowSec - tsSec) > REPLAY_WINDOW_SEC) {
+      logWarn(`timestamp expired ip=${ip}`);
+      return sendJson(res, 401, { success: false, error: "TIMESTAMP_EXPIRED" });
+    }
+    if (recentNonces.has(v.nonce)) {
+      logWarn(`replay detected ip=${ip}`);
+      return sendJson(res, 409, { success: false, error: "REPLAY_DETECTED" });
+    }
+    recentNonces.set(v.nonce, Date.now());
+
+    const botPayload = {
+      license_key: v.license_key,
+      hwid: v.hwid,
+      pc_name: v.pc_name,
+      app_version: v.app_version,
+      ip, // always trust API observed IP
+      timestamp: v.timestamp,
+      nonce: v.nonce,
+    };
+
+    // Enqueue request and wait bot result (long-poll).
+    reqSeq += 1;
+    const request_id = reqSeq;
+    queue.push({ request_id, payload: botPayload, created_at: Date.now() });
+
+    const result = await new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        waiters.delete(request_id);
+        resolve(null);
+      }, BOT_WAIT_MS);
+      waiters.set(request_id, { resolve, timeout });
     });
-  } catch (err) {
-    logErr(`unhandled error: ${err && err.message ? err.message : String(err)}`);
-    return responseWithSignature(res, 500, { success: false, error: "INTERNAL_ERROR" });
+
+    if (!result) {
+      logWarn(`bot timeout ip=${ip} ms=${Date.now() - start}`);
+      return sendJson(res, 503, { success: false, error: "BOT_TIMEOUT" });
+    }
+
+    const ok = Boolean(result.ok);
+    if (!ok) {
+      logWarn(`login fail ip=${ip} reason=${result.reason}`);
+      return sendJson(res, 401, { success: false, error: result.reason || "INVALID_KEY" });
+    }
+
+    const username = String(result.username || "hawk-user");
+    const plan = String(result.plan || "premium");
+    const expires = String(result.expires || "∞");
+    const token = signJwt({ license_key: v.license_key, hwid: v.hwid, plan, expires });
+
+    logOk(`login ok ip=${ip} ms=${Date.now() - start}`);
+    return sendJson(res, 200, { success: true, token, username, plan, expires });
+  } catch (e) {
+    const msg = e && e.message ? e.message : String(e);
+    if (DEBUG) logErr(`unhandled: ${msg}`);
+    return sendJson(res, 500, { success: false, error: "INTERNAL_ERROR" });
   }
-}
-
-app.post("/V1/validate", requireApiToken, (req, res) => {
-  handleValidate(req, res);
-});
-app.post("/v1/validate", requireApiToken, (req, res) => {
-  handleValidate(req, res);
 });
 
-function handleSessionValidate(req, res) {
-  try {
-    const body = req.body || {};
-    const token = String(body.token || "");
-    const hwid = String(body.hwid || "");
-    if (!token || !hwid) {
-      return responseWithSignature(res, 400, { success: false, error: "INVALID_BODY" });
-    }
-    if (!JWT_SECRET) {
-      return responseWithSignature(res, 500, { success: false, error: "JWT_SECRET_MISSING" });
-    }
-    const decoded = jwt.verify(token, JWT_SECRET, { algorithms: ["HS256"], issuer: "blackhawk-api" });
-    if (!decoded || decoded.hwid !== hwid) {
-      return responseWithSignature(res, 401, { success: false, error: "HWID_MISMATCH" });
-    }
-    if (BLACKLIST_KEYS.has(String(decoded.license_key || "")) || BLACKLIST_HWIDS.has(hwid)) {
-      return responseWithSignature(res, 403, { success: false, error: "BLACKLISTED" });
-    }
-    return responseWithSignature(res, 200, { success: true });
-  } catch (_e) {
-    return responseWithSignature(res, 401, { success: false, error: "SESSION_INVALID" });
-  }
-}
+// Invalid route
+app.use((_req, res) => sendJson(res, 404, { success: false, error: "NOT_FOUND" }));
 
-app.post("/V1/session/validate", requireApiToken, handleSessionValidate);
-app.post("/v1/session/validate", requireApiToken, handleSessionValidate);
-
+// Crash-safe handler
 app.use((err, _req, res, _next) => {
-  if (err instanceof SyntaxError && "body" in err) {
-    return res.status(400).json({ success: false, error: "INVALID_JSON" });
-  }
-  return res.status(500).json({ success: false, error: "INTERNAL_ERROR" });
+  logErr(`crash: ${err && err.message ? err.message : String(err)}`);
+  return sendJson(res, 500, { success: false, error: "INTERNAL_ERROR" });
 });
 
 app.listen(PORT, () => {
-  if (!API_TOKEN_SECRET || !JWT_SECRET || !RESPONSE_SIGNING_KEY) {
-    logErr("Missing required secrets: API_TOKEN_SECRET/JWT_SECRET/RESPONSE_SIGNING_KEY");
+  if (!JWT_SECRET || !RESPONSE_SIGNING_KEY || !BOT_SHARED_SECRET) {
+    logErr("Missing required env: JWT_SECRET / RESPONSE_SIGNING_KEY / BOT_SHARED_SECRET");
   }
-  if (!BOT_VALIDATE_URL && VALID_LICENSE_KEYS.size === 0) {
-    logWarn("VALID_LICENSE_KEYS is empty -> all login attempts will be rejected.");
-  } else if (!BOT_VALIDATE_URL) {
-    logInfo(`Loaded ${VALID_LICENSE_KEYS.size} license key(s).`);
-  }
-  if (BOT_VALIDATE_URL) {
-    logInfo(`Bridge mode enabled -> BOT_VALIDATE_URL=${BOT_VALIDATE_URL}`);
-  }
-  logInfo(`render api listening on :${PORT}`);
-  logDebug("debug logging enabled");
+  logInfo(`listening :${PORT} env=${NODE_ENV}`);
 });
