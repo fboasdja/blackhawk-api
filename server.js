@@ -9,6 +9,7 @@ const DEBUG = String(process.env.DEBUG_AUTH || "").toLowerCase() === "true";
 const API_TOKEN_SECRET = process.env.API_TOKEN_SECRET || "";
 const JWT_SECRET = process.env.JWT_SECRET || "";
 const RESPONSE_SIGNING_KEY = process.env.RESPONSE_SIGNING_KEY || "";
+const BOT_VALIDATE_URL = (process.env.BOT_VALIDATE_URL || "").trim();
 const VALID_LICENSE_KEYS = new Set(
   (process.env.VALID_LICENSE_KEYS || "")
     .split(",")
@@ -146,6 +147,29 @@ function responseWithSignature(res, statusCode, payload) {
   return res.status(statusCode).type("application/json").send(raw);
 }
 
+async function validateViaBotApi({ license_key, hwid, ip }) {
+  if (!BOT_VALIDATE_URL) {
+    return { ok: false, message: "BOT_VALIDATE_URL missing" };
+  }
+  try {
+    const r = await fetch(BOT_VALIDATE_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        license_key,
+        hwid,
+        ip,
+      }),
+    });
+    const data = await r.json().catch(() => ({}));
+    return data && typeof data === "object" ? data : { ok: false, message: "Invalid bot response" };
+  } catch (e) {
+    return { ok: false, message: `Bot API unreachable: ${e && e.message ? e.message : String(e)}` };
+  }
+}
+
 app.get("/", (_req, res) => {
   res.status(200).json({ success: true, service: "blackhawk-api", status: "ok" });
 });
@@ -154,7 +178,7 @@ app.get("/health", (_req, res) => {
   res.status(200).json({ success: true, status: "healthy" });
 });
 
-function handleValidate(req, res) {
+async function handleValidate(req, res) {
   cleanupReplay();
   const start = Date.now();
   try {
@@ -196,14 +220,21 @@ function handleValidate(req, res) {
     if (BLACKLIST_KEYS.has(license_key) || BLACKLIST_HWIDS.has(hwid)) {
       return responseWithSignature(res, 403, { success: false, error: "BLACKLISTED" });
     }
-    if (!VALID_LICENSE_KEYS.has(license_key)) {
-      logWarn(`invalid key=${license_key}`);
-      return responseWithSignature(res, 401, { success: false, error: "INVALID_KEY" });
+    const sourceIp = String(req.ip || req.socket.remoteAddress || ip || "");
+    const botRes = await validateViaBotApi({ license_key, hwid, ip: sourceIp });
+    if (!(botRes.ok || botRes.success)) {
+      const msg = String(botRes.message || botRes.error || "INVALID_KEY");
+      if (/key|invalid/i.test(msg)) {
+        logWarn(`invalid key=${license_key}`);
+        return responseWithSignature(res, 401, { success: false, error: "INVALID_KEY" });
+      }
+      logWarn(`bot validate failed: ${msg}`);
+      return responseWithSignature(res, 503, { success: false, error: "UPSTREAM_AUTH_UNAVAILABLE" });
     }
 
-    const username = "hawk-user";
+    const username = String(botRes.username || "hawk-user");
     const plan = "premium";
-    const expires = new Date(Date.now() + JWT_TTL_SECONDS * 1000).toISOString();
+    const expires = String(botRes.expires || new Date(Date.now() + JWT_TTL_SECONDS * 1000).toISOString());
     const token = signToken(license_key, hwid, plan, expires);
 
     logOk(`auth success key=${license_key} hwid=${hwid} ms=${Date.now() - start}`);
@@ -220,8 +251,12 @@ function handleValidate(req, res) {
   }
 }
 
-app.post("/V1/validate", requireApiToken, handleValidate);
-app.post("/v1/validate", requireApiToken, handleValidate);
+app.post("/V1/validate", requireApiToken, (req, res) => {
+  handleValidate(req, res);
+});
+app.post("/v1/validate", requireApiToken, (req, res) => {
+  handleValidate(req, res);
+});
 
 function handleSessionValidate(req, res) {
   try {
@@ -261,10 +296,13 @@ app.listen(PORT, () => {
   if (!API_TOKEN_SECRET || !JWT_SECRET || !RESPONSE_SIGNING_KEY) {
     logErr("Missing required secrets: API_TOKEN_SECRET/JWT_SECRET/RESPONSE_SIGNING_KEY");
   }
-  if (VALID_LICENSE_KEYS.size === 0) {
+  if (!BOT_VALIDATE_URL && VALID_LICENSE_KEYS.size === 0) {
     logWarn("VALID_LICENSE_KEYS is empty -> all login attempts will be rejected.");
-  } else {
+  } else if (!BOT_VALIDATE_URL) {
     logInfo(`Loaded ${VALID_LICENSE_KEYS.size} license key(s).`);
+  }
+  if (BOT_VALIDATE_URL) {
+    logInfo(`Bridge mode enabled -> BOT_VALIDATE_URL=${BOT_VALIDATE_URL}`);
   }
   logInfo(`render api listening on :${PORT}`);
   logDebug("debug logging enabled");
