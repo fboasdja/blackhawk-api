@@ -102,13 +102,14 @@ function validateLoginBody(body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) return { ok: false, error: "INVALID_BODY" };
   const license_key = safeString(body.license_key, 128);
   const hwid = safeString(body.hwid, 256);
-  const pc_name = safeString(body.pc_name, 128);
+  let pc_name = safeString(body.pc_name, 128);
+  if (!pc_name) pc_name = "hawk-app"; // hawk_app AuthClient omits pc_name (checksum-only payload)
   const app_version = safeString(body.app_version, 64);
   const ip = safeString(body.ip || "", 64); // optional; API will override from req.ip
   const nonce = safeString(body.nonce || "", 128);
 
   const timestamp = Number(body.timestamp);
-  if (!license_key || !hwid || !pc_name || !app_version) return { ok: false, error: "INVALID_FIELDS" };
+  if (!license_key || !hwid || !app_version) return { ok: false, error: "INVALID_FIELDS" };
   if (!Number.isFinite(timestamp) || timestamp <= 0) return { ok: false, error: "INVALID_TIMESTAMP" };
   if (!nonce) return { ok: false, error: "MISSING_NONCE" };
 
@@ -218,8 +219,8 @@ app.post("/v1/bot/push", requireBotSecret, (req, res) => {
   return sendJson(res, 200, { success: true });
 });
 
-// Main route (per prompt)
-app.post("/V1/login", async (req, res) => {
+// Main route (hawk_app defaults to /V1/validate; python client uses /V1/login)
+async function handleLogin(req, res) {
   const ip = String(req.ip || req.socket.remoteAddress || "unknown");
   const start = Date.now();
 
@@ -299,7 +300,11 @@ app.post("/V1/login", async (req, res) => {
     if (DEBUG) logErr(`unhandled: ${msg}`);
     return sendJson(res, 500, { success: false, error: "INTERNAL_ERROR" });
   }
-});
+}
+
+for (const path of ["/V1/login", "/v1/login", "/V1/validate", "/v1/validate"]) {
+  app.post(path, handleLogin);
+}
 
 // Invalid route
 app.use((_req, res) => sendJson(res, 404, { success: false, error: "NOT_FOUND" }));
