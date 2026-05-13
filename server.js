@@ -108,6 +108,20 @@ function invalidField(v, maxLen = 256) {
   return typeof v !== "string" || v.length === 0 || v.length > maxLen;
 }
 
+function readApiToken(req) {
+  return String(req.get("X-Api-Token") || req.get("Authorization") || "").replace(/^Bearer\s+/i, "").trim();
+}
+
+function requireApiToken(req, res, next) {
+  // Optional hardening: when API_TOKEN_SECRET is configured, require matching token header.
+  if (!API_TOKEN_SECRET) return next();
+  const token = readApiToken(req);
+  if (!token || token !== API_TOKEN_SECRET) {
+    return responseWithSignature(res, 401, { success: false, error: "UNAUTHORIZED" });
+  }
+  return next();
+}
+
 function signToken(licenseKey, hwid, plan, expires) {
   if (!JWT_SECRET) {
     throw new Error("JWT_SECRET missing");
@@ -140,7 +154,7 @@ app.get("/health", (_req, res) => {
   res.status(200).json({ success: true, status: "healthy" });
 });
 
-app.post("/V1/validate", (req, res) => {
+function handleValidate(req, res) {
   cleanupReplay();
   const start = Date.now();
   try {
@@ -204,9 +218,12 @@ app.post("/V1/validate", (req, res) => {
     logErr(`unhandled error: ${err && err.message ? err.message : String(err)}`);
     return responseWithSignature(res, 500, { success: false, error: "INTERNAL_ERROR" });
   }
-});
+}
 
-app.post("/V1/session/validate", (req, res) => {
+app.post("/V1/validate", requireApiToken, handleValidate);
+app.post("/v1/validate", requireApiToken, handleValidate);
+
+function handleSessionValidate(req, res) {
   try {
     const body = req.body || {};
     const token = String(body.token || "");
@@ -228,7 +245,10 @@ app.post("/V1/session/validate", (req, res) => {
   } catch (_e) {
     return responseWithSignature(res, 401, { success: false, error: "SESSION_INVALID" });
   }
-});
+}
+
+app.post("/V1/session/validate", requireApiToken, handleSessionValidate);
+app.post("/v1/session/validate", requireApiToken, handleSessionValidate);
 
 app.use((err, _req, res, _next) => {
   if (err instanceof SyntaxError && "body" in err) {
@@ -240,6 +260,11 @@ app.use((err, _req, res, _next) => {
 app.listen(PORT, () => {
   if (!API_TOKEN_SECRET || !JWT_SECRET || !RESPONSE_SIGNING_KEY) {
     logErr("Missing required secrets: API_TOKEN_SECRET/JWT_SECRET/RESPONSE_SIGNING_KEY");
+  }
+  if (VALID_LICENSE_KEYS.size === 0) {
+    logWarn("VALID_LICENSE_KEYS is empty -> all login attempts will be rejected.");
+  } else {
+    logInfo(`Loaded ${VALID_LICENSE_KEYS.size} license key(s).`);
   }
   logInfo(`render api listening on :${PORT}`);
   logDebug("debug logging enabled");
