@@ -205,15 +205,22 @@ app.use(
   }),
 );
 
+// Chỉ giới hạn login app — KHÔNG limit /health, /v1/config, /v1/bot/* (bot keep-alive + pull).
 app.use(
   rateLimit({
     windowMs: 60_000,
-    max: 30,
+    max: 120,
     standardHeaders: true,
     legacyHeaders: false,
+    skip: (req) => {
+      const p = String(req.path || "");
+      if (p === "/health" || p === "/" || p === "/v1/config") return true;
+      if (p.startsWith("/v1/bot/") || p.startsWith("/v1/config/")) return true;
+      return false;
+    },
     handler: (req, res) => {
       const ip = String(req.ip || "unknown");
-      logWarn(`rate limit ip=${ip}`);
+      logWarn(`rate limit ip=${ip} path=${req.path}`);
       return sendJson(res, 429, { success: false, error: "TOO_MANY_REQUESTS" });
     },
   }),
