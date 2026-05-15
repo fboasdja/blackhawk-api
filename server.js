@@ -19,10 +19,14 @@ const API_TOKEN_SECRET = String(process.env.API_TOKEN_SECRET || "").trim(); // a
 const BOT_SHARED_SECRET = String(process.env.BOT_SHARED_SECRET || "").trim(); // api -> bot (required)
 const JWT_SECRET = String(process.env.JWT_SECRET || "").trim(); // required
 const RESPONSE_SIGNING_KEY = String(process.env.RESPONSE_SIGNING_KEY || "").trim(); // required (anti fake response)
-const BOT_WAIT_MS = Math.max(2000, Number(process.env.BOT_WAIT_MS || 15000)); // API waits for bot result (long-poll)
-// Render gọi THẲNG bot (inbound) — không cần bot pull ra Render (fix host chặn outbound).
-const BOT_CALLBACK_URL = String(process.env.BOT_CALLBACK_URL || "").trim().replace(/\/+$/, "");
-const BOT_CALLBACK_TIMEOUT_MS = Math.max(3000, Number(process.env.BOT_CALLBACK_TIMEOUT_MS || 12000));
+const BOT_WAIT_MS = Math.max(3000, Number(process.env.BOT_WAIT_MS || 18000)); // app login chờ bot pull+push
+const FORCE_PULL_MODE = String(process.env.FORCE_PULL_MODE || "true").toLowerCase() !== "false";
+// Callback chỉ khi host có IP public. Host không public: để TRỐNG + FORCE_PULL_MODE=true.
+const BOT_CALLBACK_URL = FORCE_PULL_MODE
+  ? ""
+  : String(process.env.BOT_CALLBACK_URL || "").trim().replace(/\/+$/, "");
+const BOT_CALLBACK_TIMEOUT_MS = Math.max(3000, Number(process.env.BOT_CALLBACK_TIMEOUT_MS || 8000));
+const BOT_PULL_HOLD_MS = Math.max(1000, Math.min(28000, Number(process.env.BOT_PULL_HOLD_MS || 22000)));
 
 const JWT_TTL_SECONDS = Math.max(60, Number(process.env.JWT_TTL_SECONDS || 900));
 const REPLAY_WINDOW_SEC = Math.max(30, Number(process.env.REPLAY_WINDOW_SEC || 120));
@@ -280,8 +284,23 @@ app.post("/v1/config/register", requireBotSecret, (req, res) => {
 });
 
 app.post("/v1/bot/pull", requireBotSecret, (req, res) => {
-  const item = queue.shift() || null;
-  return sendJson(res, 200, { success: true, item });
+  const immediate = queue.shift();
+  if (immediate) {
+    return sendJson(res, 200, { success: true, item: immediate });
+  }
+  // Long-poll: bot giữ kết nối, login tới là nhận job ngay (không cần IP public).
+  const deadline = Date.now() + BOT_PULL_HOLD_MS;
+  const waitTick = () => {
+    const item = queue.shift();
+    if (item) {
+      return sendJson(res, 200, { success: true, item });
+    }
+    if (Date.now() >= deadline) {
+      return sendJson(res, 200, { success: true, item: null });
+    }
+    setTimeout(waitTick, 250);
+  };
+  setTimeout(waitTick, 250);
 });
 
 app.post("/v1/bot/push", requireBotSecret, (req, res) => {
@@ -353,14 +372,16 @@ async function handleLogin(req, res) {
     let result = null;
     if (BOT_CALLBACK_URL) {
       result = await callBotCallback(botPayload);
-    }
-    if (!result) {
+      if (!result) {
+        logWarn(`bot callback failed ip=${ip} ms=${Date.now() - start} url=${BOT_CALLBACK_URL}`);
+        return sendJson(res, 503, { success: false, error: "BOT_CALLBACK_FAILED" });
+      }
+    } else {
       result = await waitBotPullResult(botPayload);
-    }
-
-    if (!result) {
-      logWarn(`bot timeout ip=${ip} ms=${Date.now() - start} callback=${Boolean(BOT_CALLBACK_URL)}`);
-      return sendJson(res, 503, { success: false, error: "BOT_TIMEOUT" });
+      if (!result) {
+        logWarn(`bot pull timeout ip=${ip} ms=${Date.now() - start}`);
+        return sendJson(res, 503, { success: false, error: "BOT_TIMEOUT" });
+      }
     }
 
     const ok = Boolean(result.ok);
@@ -397,10 +418,10 @@ app.use((err, _req, res, _next) => {
 });
 
 app.listen(PORT, () => {
-  if (BOT_CALLBACK_URL) {
-    logInfo(`bot callback enabled -> ${BOT_CALLBACK_URL}`);
+  if (FORCE_PULL_MODE || !BOT_CALLBACK_URL) {
+    logInfo(`auth mode=PULL (bot outbound only, BOT_WAIT_MS=${BOT_WAIT_MS}, pull_hold=${BOT_PULL_HOLD_MS}ms)`);
   } else {
-    logWarn("BOT_CALLBACK_URL not set — using pull mode (bot must reach Render outbound)");
+    logInfo(`auth mode=CALLBACK -> ${BOT_CALLBACK_URL}`);
   }
   if (!JWT_SECRET || !RESPONSE_SIGNING_KEY || !BOT_SHARED_SECRET) {
     logErr("Missing required env: JWT_SECRET / RESPONSE_SIGNING_KEY / BOT_SHARED_SECRET");
