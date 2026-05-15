@@ -36,6 +36,11 @@ const queue = [];
 const waiters = new Map(); // request_id -> { resolve, timeout }
 let reqSeq = 0;
 
+// App tự lấy URL bot — owner chỉ cần bot đăng ký 1 lần (hoặc set PUBLIC_VALIDATE_URL trên Render).
+let publicValidateUrl = String(process.env.PUBLIC_VALIDATE_URL || BOT_CALLBACK_URL || "")
+  .trim()
+  .replace(/\/+$/, "");
+
 const C = {
   reset: "\x1b[0m",
   cyan: "\x1b[36m",
@@ -243,6 +248,29 @@ function requireBotSecret(req, res, next) {
   }
   return next();
 }
+
+app.get("/v1/config", (_req, res) => {
+  const url = publicValidateUrl;
+  if (!url) {
+    return sendJson(res, 503, { success: false, error: "CONFIG_NOT_READY", validate_url: "" });
+  }
+  return sendJson(res, 200, { success: true, validate_url: url });
+});
+
+app.post("/v1/config/register", requireBotSecret, (req, res) => {
+  const body = req.body || {};
+  let url = safeString(String(body.validate_url || ""), 256);
+  if (!url) {
+    return sendJson(res, 400, { success: false, error: "INVALID_URL" });
+  }
+  url = url.replace(/\/+$/, "");
+  if (!/\/v1\/validate$/i.test(url) && !/\/validate$/i.test(url)) {
+    url = `${url}/v1/validate`;
+  }
+  publicValidateUrl = url;
+  logInfo(`public validate_url registered -> ${publicValidateUrl}`);
+  return sendJson(res, 200, { success: true, validate_url: publicValidateUrl });
+});
 
 app.post("/v1/bot/pull", requireBotSecret, (req, res) => {
   const item = queue.shift() || null;
