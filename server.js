@@ -19,7 +19,7 @@ const API_TOKEN_SECRET = String(process.env.API_TOKEN_SECRET || "").trim(); // a
 const BOT_SHARED_SECRET = String(process.env.BOT_SHARED_SECRET || "").trim(); // api -> bot (required)
 const JWT_SECRET = String(process.env.JWT_SECRET || "").trim(); // required
 const RESPONSE_SIGNING_KEY = String(process.env.RESPONSE_SIGNING_KEY || "").trim(); // required (anti fake response)
-const BOT_WAIT_MS = Math.max(1500, Number(process.env.BOT_WAIT_MS || 8000)); // API waits for bot result (long-poll)
+const BOT_WAIT_MS = Math.max(2000, Number(process.env.BOT_WAIT_MS || 15000)); // API waits for bot result (long-poll)
 
 const JWT_TTL_SECONDS = Math.max(60, Number(process.env.JWT_TTL_SECONDS || 900));
 const REPLAY_WINDOW_SEC = Math.max(30, Number(process.env.REPLAY_WINDOW_SEC || 120));
