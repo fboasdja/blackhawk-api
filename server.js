@@ -20,6 +20,9 @@ const BOT_SHARED_SECRET = String(process.env.BOT_SHARED_SECRET || "").trim(); //
 const JWT_SECRET = String(process.env.JWT_SECRET || "").trim(); // required
 const RESPONSE_SIGNING_KEY = String(process.env.RESPONSE_SIGNING_KEY || "").trim(); // required (anti fake response)
 const BOT_WAIT_MS = Math.max(2000, Number(process.env.BOT_WAIT_MS || 15000)); // API waits for bot result (long-poll)
+// Render gọi THẲNG bot (inbound) — không cần bot pull ra Render (fix host chặn outbound).
+const BOT_CALLBACK_URL = String(process.env.BOT_CALLBACK_URL || "").trim().replace(/\/+$/, "");
+const BOT_CALLBACK_TIMEOUT_MS = Math.max(3000, Number(process.env.BOT_CALLBACK_TIMEOUT_MS || 12000));
 
 const JWT_TTL_SECONDS = Math.max(60, Number(process.env.JWT_TTL_SECONDS || 900));
 const REPLAY_WINDOW_SEC = Math.max(30, Number(process.env.REPLAY_WINDOW_SEC || 120));
@@ -116,11 +119,59 @@ function validateLoginBody(body) {
   return { ok: true, license_key, hwid, pc_name, app_version, ip, nonce, timestamp };
 }
 
-async function callBotAuth(payload, sourceIp) {
-  if (!BOT_SHARED_SECRET) throw new Error("BOT_SHARED_SECRET missing");
-  // In pull-mode, API does not call bot directly.
-  // This function is kept for compatibility but no longer used.
-  return { status: 503, data: { ok: false, reason: "PULL_MODE" } };
+function mapBotValidateResponse(data) {
+  if (!data || typeof data !== "object") return null;
+  const ok = Boolean(data.ok || data.success);
+  return {
+    ok,
+    reason: ok ? "OK" : String(data.message || data.reason || data.error || "INVALID_KEY"),
+    username: String(data.username || "hawk-user"),
+    plan: String(data.plan || "premium"),
+    expires: String(data.expires || "∞"),
+  };
+}
+
+/** Gọi hawk_api trên bot (port 8787) — bot không cần kết nối ra Render. */
+async function callBotCallback(botPayload) {
+  if (!BOT_CALLBACK_URL || !BOT_SHARED_SECRET) return null;
+  try {
+    const r = await axios.post(
+      BOT_CALLBACK_URL,
+      {
+        license_key: botPayload.license_key,
+        hwid: botPayload.hwid,
+        ip: botPayload.ip,
+        pc_name: botPayload.pc_name,
+        app_version: botPayload.app_version,
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Bot-Secret": BOT_SHARED_SECRET,
+        },
+        timeout: BOT_CALLBACK_TIMEOUT_MS,
+      },
+    );
+    return mapBotValidateResponse(r.data);
+  } catch (e) {
+    const msg = e && e.message ? e.message : String(e);
+    logWarn(`bot callback fail url=${BOT_CALLBACK_URL} err=${msg}`);
+    return null;
+  }
+}
+
+async function waitBotPullResult(botPayload) {
+  reqSeq += 1;
+  const request_id = reqSeq;
+  queue.push({ request_id, payload: botPayload, created_at: Date.now() });
+
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      waiters.delete(request_id);
+      resolve(null);
+    }, BOT_WAIT_MS);
+    waiters.set(request_id, { resolve, timeout });
+  });
 }
 
 function signJwt({ license_key, hwid, plan, expires }) {
@@ -264,21 +315,16 @@ async function handleLogin(req, res) {
       nonce: v.nonce,
     };
 
-    // Enqueue request and wait bot result (long-poll).
-    reqSeq += 1;
-    const request_id = reqSeq;
-    queue.push({ request_id, payload: botPayload, created_at: Date.now() });
-
-    const result = await new Promise((resolve) => {
-      const timeout = setTimeout(() => {
-        waiters.delete(request_id);
-        resolve(null);
-      }, BOT_WAIT_MS);
-      waiters.set(request_id, { resolve, timeout });
-    });
+    let result = null;
+    if (BOT_CALLBACK_URL) {
+      result = await callBotCallback(botPayload);
+    }
+    if (!result) {
+      result = await waitBotPullResult(botPayload);
+    }
 
     if (!result) {
-      logWarn(`bot timeout ip=${ip} ms=${Date.now() - start}`);
+      logWarn(`bot timeout ip=${ip} ms=${Date.now() - start} callback=${Boolean(BOT_CALLBACK_URL)}`);
       return sendJson(res, 503, { success: false, error: "BOT_TIMEOUT" });
     }
 
@@ -316,6 +362,11 @@ app.use((err, _req, res, _next) => {
 });
 
 app.listen(PORT, () => {
+  if (BOT_CALLBACK_URL) {
+    logInfo(`bot callback enabled -> ${BOT_CALLBACK_URL}`);
+  } else {
+    logWarn("BOT_CALLBACK_URL not set — using pull mode (bot must reach Render outbound)");
+  }
   if (!JWT_SECRET || !RESPONSE_SIGNING_KEY || !BOT_SHARED_SECRET) {
     logErr("Missing required env: JWT_SECRET / RESPONSE_SIGNING_KEY / BOT_SHARED_SECRET");
   }
